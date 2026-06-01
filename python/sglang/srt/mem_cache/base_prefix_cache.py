@@ -68,6 +68,8 @@ class InsertResult:
 
     prefix_len: int
     mamba_exist: bool = False
+    # Deepest TreeNode created/touched by this insert.
+    last_node_id: Optional[int] = None
 
 
 @dataclasses.dataclass

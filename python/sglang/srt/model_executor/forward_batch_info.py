@@ -439,7 +439,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For fuzzy prefix matching
     fuzzy_matched_len: int = 0  # Number of tokens from fuzzy match
     fuzzy_cached_start_pos: int = 0  # Original position where fuzzy KV was computed
-    # Reference to req objects (for fuzzy realization flag propagation)
+    # Optional N:M segments from semantic providers.
+    fuzzy_segments: Optional[list] = None
+    fuzzy_layer_recompute_mask: Optional[list] = None
     reqs: Optional[list] = None
 
     @classmethod
@@ -493,14 +495,19 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         )
         device = model_runner.device
 
-        # Populate fuzzy match info from the first request (single-request batch assumption)
+        # Legacy first-request fields; ModelRunner uses per-request state.
         if batch.reqs and len(batch.reqs) > 0:
             ret.reqs = batch.reqs
             first_req = batch.reqs[0]
             ret.fuzzy_matched_len = getattr(first_req, 'cache_fuzzy_matched_len', 0)
-            fuzzy_match_result = getattr(first_req, 'fuzzy_match_result', None)
-            if fuzzy_match_result is not None:
-                ret.fuzzy_cached_start_pos = getattr(fuzzy_match_result, 'cached_start_pos', 0)
+            if ret.fuzzy_matched_len > 0:
+                fuzzy_match_result = getattr(first_req, 'fuzzy_match_result', None)
+                if fuzzy_match_result is not None:
+                    ret.fuzzy_cached_start_pos = getattr(fuzzy_match_result, 'cached_start_pos', 0)
+                    ret.fuzzy_segments = getattr(fuzzy_match_result, 'segments', None)
+                    ret.fuzzy_layer_recompute_mask = getattr(
+                        fuzzy_match_result, 'layer_recompute_mask', None,
+                    )
 
 
         if batch.extend_input_logprob_token_ids is not None:

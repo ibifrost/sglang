@@ -732,10 +732,13 @@ class Req(ReqDllmMixin):
         self.swa_uuid_for_lock: Optional[int] = None
         # The prefix length that is inserted into the tree cache
         self.cache_protected_len: int = 0
-        # The fuzzy-matched prefix length. These indices come from another
-        # request's tree nodes via non_prefix_store and should NOT be freed
-        # in cache_finished_req since they're not this request's own allocation.
+        # Number of fuzzy-matched tokens appended to prefix_indices.
         self.cache_fuzzy_matched_len: int = 0
+        # Donor TreeNode protected until this request finishes.
+        self.fuzzy_donor_node: Any = None
+
+        # Recipient-owned slots reserved for RoPE-corrected donor KV.
+        self.fuzzy_realized_locs: Any = None
 
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
@@ -966,7 +969,7 @@ class Req(ReqDllmMixin):
         input_len = len(self.fill_ids)
 
         # Streaming sessions reuse committed KV from the session slot, so
-        # custom logprob_start_len is not supported — override to -1.
+        # custom logprob_start_len is not supported - override to -1.
         if (
             self.session is not None
             and self.session.streaming
@@ -1022,7 +1025,7 @@ class Req(ReqDllmMixin):
             else:
                 self.cache_protected_len = len(self.prefix_indices)
 
-            # Track fuzzy-matched length to avoid freeing these indices
+            # Track fuzzy length for cache cleanup and RoPE realization.
             if match_result.fuzzy_matched_len is not None:
                 self.cache_fuzzy_matched_len = match_result.fuzzy_matched_len
             else:
@@ -1221,6 +1224,7 @@ class Req(ReqDllmMixin):
         self.routed_experts = None
         self.last_node = None
         self.swa_uuid_for_lock = None
+        # Keep fuzzy_donor_node locked until cache_finished_req releases it.
         self.extend_input_len = 0
         self.is_retracted = True
         self.retracted_stain = True
@@ -1672,7 +1676,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
             # If input_embeds are available, store them
             if req.input_embeds is not None:
-                # Slice to match extend_input_len — PrefillAdder truncates
+                # Slice to match extend_input_len - PrefillAdder truncates
                 # fill_ids/extend_input_len on chunk overflow but not input_embeds.
                 input_embeds.extend(
                     req.input_embeds[pre_len : pre_len + req.extend_input_len]

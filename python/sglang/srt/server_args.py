@@ -368,13 +368,14 @@ class ServerArgs:
     # Fuzzy matching
     enable_fuzzy_match: bool = False
     fuzzy_min_match_length: int = 16
-    fuzzy_semantic_threshold: float = 0.85
-    fuzzy_match_provider: str = "TokenBlockMatch"
+    fuzzy_semantic_threshold: float = 0.60
+    fuzzy_match_provider: str = "SemanticEmbedding"
     cache_fuzzy_results: bool = True
-    fuzzy_eviction_policy: str = "LRU"
-    fuzzy_non_prefix_max_entries: int = 10000
-    fuzzy_block_size: int = 16
     embedding_model_name: str = "all-MiniLM-L6-v2"
+
+    # SemanticEmbedding-specific.
+    fuzzy_model_arch: Optional[str] = None
+    fuzzy_min_reuse_ratio: float = 0.50
     
     enable_prefill_delayer: bool = False
     prefill_delayer_max_delay_passes: int = 30
@@ -1094,7 +1095,7 @@ class ServerArgs:
                 if os.path.exists(alt):
                     return alt
 
-            # Cache miss — download from ModelScope hub
+            # Cache miss - download from ModelScope hub
             return ms_snapshot_download(
                 path,
                 cache_dir=self.download_dir,
@@ -4374,19 +4375,27 @@ class ServerArgs:
             "--fuzzy-min-match-length",
             type=int,
             default=ServerArgs.fuzzy_min_match_length,
-            help="Minimum number of tokens that must be matched for fuzzy matching to trigger.",
+            help=(
+                "Minimum token span a fuzzy provider may reuse. Partial "
+                "exact anchors shorter than this are skipped."
+            ),
         )
         parser.add_argument(
             "--fuzzy-semantic-threshold",
             type=float,
             default=ServerArgs.fuzzy_semantic_threshold,
-            help="Similarity threshold for semantic matching (0.0 - 1.0).",
+            help=(
+                "Cosine-similarity threshold for SemanticEmbedding matches "
+                "(0.0 - 1.0). Higher = stricter "
+                "(fewer matches, higher precision); lower = more permissive. "
+                "Below ~0.50 alignment quality drops quickly."
+            ),
         )
         parser.add_argument(
             "--fuzzy-match-provider",
             type=str,
             default=ServerArgs.fuzzy_match_provider,
-            choices=["TokenBlockMatch", "SemanticEmbedding"],
+            choices=["SemanticEmbedding"],
             help="Provider class for fuzzy matching logic.",
         )
         parser.add_argument(
@@ -4395,29 +4404,23 @@ class ServerArgs:
             help="Cache fuzzy match results for future reuse.",
         )
         parser.add_argument(
-            "--fuzzy-eviction-policy",
-            type=str,
-            choices=RADIX_EVICTION_POLICY_CHOICES,
-            default=ServerArgs.fuzzy_eviction_policy,
-            help="Eviction policy for fuzzy radix tree.",
-        )
-        parser.add_argument(
-            "--fuzzy-non-prefix-max-entries",
-            type=int,
-            default=ServerArgs.fuzzy_non_prefix_max_entries,
-            help="Maximum entries in non-prefix store.",
-        )
-        parser.add_argument(
-            "--fuzzy-block-size",
-            type=int,
-            default=ServerArgs.fuzzy_block_size,
-            help="Block size for TokenBlockMatchProvider (tokens per block).",
-        )
-        parser.add_argument(
             "--embedding-model-name",
             type=str,
             default=ServerArgs.embedding_model_name,
             help="Embedding model name for SemanticEmbeddingProvider.",
+        )
+        parser.add_argument(
+            "--fuzzy-model-arch",
+            type=str,
+            default=ServerArgs.fuzzy_model_arch,
+            help="Model arch tag for SemanticEmbeddingProvider's bathtub-curve "
+                 "preset selector (e.g. 'llama', 'qwen2.5-7b').",
+        )
+        parser.add_argument(
+            "--fuzzy-min-reuse-ratio",
+            type=float,
+            default=ServerArgs.fuzzy_min_reuse_ratio,
+            help="Minimum reuse ratio (matched / prompt tokens) for a semantic hit.",
         )
         parser.add_argument(
             "--enable-prefill-delayer",

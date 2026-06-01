@@ -16,7 +16,7 @@
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Any, List, Optional
 
 import torch
 
@@ -26,62 +26,62 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class FuzzyMatchSegment:
+    """One contiguous span in a provider-supplied fuzzy match plan."""
+
+    target_positions: torch.Tensor
+    donor_positions: torch.Tensor
+
+    # NodeRef-based addressing (preferred for new providers).
+    donor_node_id: Optional[int] = None
+    donor_offset: Optional[int] = None
+    length: Optional[int] = None
+
+    # Legacy pool-indices tensor.
+    donor_kv_indices: Optional[torch.Tensor] = None
+
+    donor_req_id: Optional[str] = None
+    layer_recompute_mask: Optional[List[bool]] = None
+
+
+@dataclass
+class QualitySignals:
+    """Optional provider metrics used for logging and debugging."""
+
+    cosine_similarity: float
+    reuse_ratio: float
+    confidence_tier: str
+    passed_quality_gate: bool
+    rejection_reason: Optional[str] = None
+
+
+@dataclass
 class FuzzyMatchResult:
-    """Result returned by fuzzy matching.
-    
-    Attributes:
-        cached_token_count: Number of tokens found in cache that can be reused.
-        cached_token_ids: The token IDs of the cached sequence.
-        prompt_token_count: Number of tokens in the current prompt that this cache replaces.
-            May differ from cached_token_count for semantic matching.
-        kv_cache_indices: KV cache indices to reuse (after-RoPE, from the memory pool).
-        position_offset: Position offset to apply when reusing this cache.
-        cached_start_pos: The original starting position where the cached KV was
-            computed (for RoPE reversal). When reusing cached KV, we need to
-            reverse RoPE at cached_start_pos and re-apply RoPE at the new position.
-    """
+    """Fuzzy match candidate returned to RadixCache."""
+
     cached_token_count: int
     cached_token_ids: List[int]
     prompt_token_count: int
     kv_cache_indices: torch.Tensor
     position_offset: int
     cached_start_pos: int = 0
+    # Optional fields used by SemanticEmbedding.
+    segments: Optional[List[FuzzyMatchSegment]] = None
+    layer_recompute_mask: Optional[List[bool]] = None
+    quality_signals: Optional[QualitySignals] = None
+    donor_last_node_id: Optional[int] = None
+    _match_entry: Any = None
 
 
 class FuzzyMatchProvider(ABC):
-    """Abstract interface for fuzzy/semantic prefix matching.
-
-    This provider is ONLY invoked when exact prefix matching fails to cover
-    the full prompt (matched n < L-1). Its sole responsibility is to manage
-    fuzzy KV cache: lookup, read, and write. It does NOT handle exact-match
-    caching -- that remains in SGLang's original RadixCache.
-
-    Community implementations can provide:
-    - Embedding-based semantic similarity matching (token IDs/counts may differ)
-    - Token-level block-matching (token IDs identical, but at non-prefix positions)
-    - Hybrid approaches
-
-    Usage:
-        1. Subclass FuzzyMatchProvider
-        2. Implement cache_on_request_finished() and match_on_prefix_miss()
-        3. Register with RadixCache via init_fuzzy_match()
-    """
+    """Provider interface used when exact prefix matching misses."""
     
     def __init__(self, config):
-        """Initialize the semantic provider.
-        
-        Args:
-            config: FuzzyMatchConfig instance containing configuration parameters.
-        """
         self.config = config
         self.min_match_length = config.fuzzy_min_match_length
     
     def set_min_match_length(self, length: int) -> None:
-        """Set the minimum number of tokens required for a fuzzy match.
-        
-        Args:
-            length: Minimum match length in tokens.
-        """
+        """Set the minimum match length in tokens."""
         self.min_match_length = length
     
     @abstractmethod
@@ -94,70 +94,31 @@ class FuzzyMatchProvider(ABC):
         cache_end_pos: int,
         radix_tree=None,
     ) -> bool:
-        """Called when a request completes. Decides whether to cache its KV
-        into the fuzzy-matching storage structures.
-        
-        Args:
-            request: The completed request object (Req).
-            token_ids: Full token sequence of the request.
-            kv_cache: KV cache tensor (after-RoPE) for this request.
-            cache_start_pos: Starting position of the cacheable segment.
-            cache_end_pos: Ending position (exclusive) of the cacheable segment.
-            radix_tree: Radix tree instance for creating node references.
-            
-        Returns:
-            True if the KV cache was stored, False otherwise.
-        """
+        """Register a completed request as a future donor."""
         pass
     
+    def on_donor_inserted(self, request, donor_last_node_id: int) -> None:
+        """Receive the TreeNode id created by RadixCache insertion."""
+        return None
+
+    def on_cache_reset(self) -> None:
+        """Clear provider-side state after the owning cache resets."""
+        return None
+
     @abstractmethod
     def match_on_prefix_miss(
         self,
         prompt_token_ids: List[int],
         already_matched_len: int,
+        request=None,
+        extra_key=None,
     ) -> Optional[FuzzyMatchResult]:
-        """Called when exact prefix matching falls short.
-        
-        Args:
-            prompt_token_ids: Complete token IDs of the current prompt.
-            already_matched_len: Number of tokens already matched by
-                the exact radix tree (n in the design).
-                
-        Returns:
-            FuzzyMatchResult if a match is found, None otherwise.
-            
-        Implementation Notes:
-            - Should check FuzzyRadixTree first, then NonPrefixKVStore.
-            - Must respect min_match_length threshold.
-            - For semantic matching, the provider may use its own
-              embedding store and return mappings between prompt
-              tokens and cached tokens.
-        """
+        """Return a fuzzy match for a request whose exact prefix missed."""
         pass
 
 
 def create_fuzzy_match_provider(config: FuzzyMatchConfig) -> Optional["FuzzyMatchProvider"]:
-    """Create a fuzzy match provider based on configuration.
-
-    Args:
-        config: Fuzzy matching configuration.
-
-    Returns:
-        FuzzyMatchProvider instance or None if fuzzy matching is disabled.
-
-    Raises:
-        ValueError: If the provider name is unknown.
-        NotImplementedError: If the provider is not yet implemented.
-
-    Example:
-        >>> config = FuzzyMatchConfig(
-        ...     enable_fuzzy_match=True,
-        ...     fuzzy_match_provider="TokenBlockMatch",
-        ... )
-        >>> provider = create_fuzzy_match_provider(config)
-        >>> print(type(provider))
-        <class 'TokenBlockMatchProvider'>
-    """
+    """Create the configured fuzzy match provider."""
     if not config.enable_fuzzy_match:
         logger.debug("Fuzzy matching is disabled")
         return None
@@ -165,19 +126,13 @@ def create_fuzzy_match_provider(config: FuzzyMatchConfig) -> Optional["FuzzyMatc
     provider_name = config.fuzzy_match_provider
     logger.info(f"Creating semantic provider: {provider_name}")
     
-    if provider_name == "TokenBlockMatch":
-        from sglang.srt.mem_cache.fuzzy_match.token_block_match import (
-            TokenBlockMatchProvider,
+    if provider_name == "SemanticEmbedding":
+        from sglang.srt.mem_cache.fuzzy_match.semantic_embedding import (
+            SemanticEmbeddingProvider,
         )
-        return TokenBlockMatchProvider(config)
-    elif provider_name == "SemanticEmbedding":
-        # TODO: Implement SemanticEmbeddingProvider
-        raise NotImplementedError(
-            "SemanticEmbeddingProvider is not yet implemented. "
-            "This provider requires FAISS and SentenceTransformer dependencies."
-        )
+        return SemanticEmbeddingProvider(config)
     else:
         raise ValueError(
             f"Unknown fuzzy match provider: {provider_name}. "
-            f"Supported providers: 'TokenBlockMatch', 'SemanticEmbedding'"
+            f"Supported providers: 'SemanticEmbedding'"
         )
